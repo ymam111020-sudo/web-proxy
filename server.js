@@ -29,6 +29,10 @@ app.all('/proxy', async (req, res) => {
       'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8',
     };
 
+    if (targetUrl.includes('duckduckgo.com')) {
+      headers['Cookie'] = 'p=-2; kp=-2;';
+    }
+
     let requestBody = req.body;
     if (req.method === 'POST') {
       if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
@@ -48,10 +52,14 @@ app.all('/proxy', async (req, res) => {
     });
 
     const finalUrl = response.request?.res?.responseUrl || targetUrl;
+    
+    // 自サーバーのプロキシURLを絶対パスで生成
+    const proxyPrefix = `https://${req.get('host')}/proxy?url=`;
 
     Object.keys(response.headers).forEach(key => {
       const lower = key.toLowerCase();
-      if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin'].includes(lower)) {
+      // iframeをブロックするヘッダー群を完全消去
+      if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin', 'strict-transport-security', 'x-xss-protection'].includes(lower)) {
         res.setHeader(key, response.headers[key]);
       }
     });
@@ -62,15 +70,51 @@ app.all('/proxy', async (req, res) => {
     if (contentType.includes('text/html') || contentType.includes('text/css')) {
       let text = data.toString('utf-8');
 
-      // iframe内でのページ遷移を検知してURLバーに同期させるスクリプト
-      const injectScript = `<script>window.parent.postMessage({ type: 'pageLoaded', url: '${finalUrl}' }, '*');</script>`;
       if (contentType.includes('text/html')) {
+        // 1. プロキシの誤作動を引き起こす <base> と、別タブを開こうとする target="_blank" を消去
+        text = text.replace(/<base[^>]*>/gi, '');
+        text = text.replace(/target\s*=\s*(["']?)_blank\1/gi, '');
+
+        // 2. 🌟 最終兵器：クリックとフォーム送信を100%横取りしてプロキシへ向かわせるJS
+        const injectScript = `
+          <script>
+            // URLの手元への同期
+            try { window.parent.postMessage({ type: 'pageLoaded', url: '${finalUrl}' }, '*'); } catch(e) {}
+
+            // GETフォームの横取り（検索窓などのバグ修正）
+            document.addEventListener('submit', function(e) {
+              if(e.target && (!e.target.method || e.target.method.toLowerCase() === 'get')) {
+                e.preventDefault();
+                const formData = new FormData(e.target);
+                const params = new URLSearchParams(formData);
+                let actionUrl;
+                try { actionUrl = new URL(e.target.action || window.location.href); } catch(err){ return; }
+                const urlParam = actionUrl.searchParams.get('url');
+                if (urlParam) {
+                   const targetUrlObj = new URL(urlParam);
+                   for(let [k,v] of params) { targetUrlObj.searchParams.append(k,v); }
+                   window.location.href = "${proxyPrefix}" + encodeURIComponent(targetUrlObj.href);
+                }
+              }
+            });
+
+            // 全リンククリックの横取り（変換漏れリンクを踏んでも絶対にエラーにさせない）
+            document.addEventListener('click', function(e) {
+               const a = e.target.closest('a');
+               if(a && a.href && !a.href.includes('/proxy?url=') && !a.href.startsWith('javascript:') && !a.href.startsWith('data:') && !a.href.startsWith('#')) {
+                   e.preventDefault();
+                   window.location.href = "${proxyPrefix}" + encodeURIComponent(a.href);
+               }
+            });
+          </script>
+        `;
         text = text.replace(/<head[^>]*>/i, `$&${injectScript}`);
       }
 
-      // 1. 通常のリンクや画像パスの書き換え
-      text = text.replace(/(href|src|action)=["']([^"']+)["']/gi, (match, attr, url) => {
-        if (url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('#')) return match;
+      // 3. サーバー側でのURL書き換え（""で囲まれていない特殊なURL表記にも対応）
+      text = text.replace(/(href|src|action)\s*=\s*(?:["']([^"']+)["']|([^\s>]+))/gi, (match, attr, quoted, unquoted) => {
+        let url = quoted || unquoted;
+        if (!url || url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('#')) return match;
         try {
           url = unescapeHtml(url);
           let absoluteUrl = new URL(url, finalUrl).href; 
@@ -79,39 +123,23 @@ app.all('/proxy', async (req, res) => {
             const vid = u.searchParams.get('v') || u.pathname.slice(1);
             absoluteUrl = `https://yewtu.be/watch?v=${vid}`;
           }
-          return `${attr}="/proxy?url=${encodeURIComponent(absoluteUrl)}"`;
+          return `${attr}="${proxyPrefix}${encodeURIComponent(absoluteUrl)}"`;
         } catch (e) {
           return match;
         }
       });
 
-      // 2. CSS内の画像の書き換え
-      text = text.replace(/url\(['"]?([^'"\)]+)['"]?\)/gi, (match, url) => {
-        if (url.startsWith('data:')) return match;
+      text = text.replace(/url\(\s*(?:["']([^'"\)]+)["']|([^'"\)]+))\s*\)/gi, (match, quoted, unquoted) => {
+        let url = quoted || unquoted;
+        if (!url || url.startsWith('data:')) return match;
         try {
           url = unescapeHtml(url);
           const absoluteUrl = new URL(url, finalUrl).href;
-          return `url('/proxy?url=${encodeURIComponent(absoluteUrl)}')`;
+          return `url("${proxyPrefix}${encodeURIComponent(absoluteUrl)}")`;
         } catch (e) {
           return match;
         }
       });
-
-      // 3. 🌟 1秒ループの原因（<meta refresh>）をプロキシ経由に修正
-      text = text.replace(/content=["']([0-9]+;\s*url=)([^"']+)["']/gi, (match, prefix, url) => {
-        try {
-          url = unescapeHtml(url);
-          const absoluteUrl = new URL(url, finalUrl).href;
-          return `content="${prefix}/proxy?url=${encodeURIComponent(absoluteUrl)}"`;
-        } catch (e) {
-          return match;
-        }
-      });
-
-      // 4. 🌟 DuckDuckGoなら、Botにバレないよう「透明なセーフサーチOFFボタン」をフォームに仕込む
-      if (finalUrl.includes('duckduckgo.com')) {
-        text = text.replace(/(<form[^>]+>)/gi, '$1<input type="hidden" name="kp" value="-2">');
-      }
 
       data = Buffer.from(text, 'utf-8');
     }
