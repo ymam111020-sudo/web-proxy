@@ -52,7 +52,6 @@ app.all('/proxy', async (req, res) => {
 
     Object.keys(response.headers).forEach(key => {
       const lower = key.toLowerCase();
-      // iframeを弾く防衛システムを完全に無力化
       if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin', 'strict-transport-security', 'x-xss-protection'].includes(lower)) {
         res.setHeader(key, response.headers[key]);
       }
@@ -65,36 +64,49 @@ app.all('/proxy', async (req, res) => {
       let text = data.toString('utf-8');
 
       if (contentType.includes('text/html')) {
-        // 別タブを開く処理やベースURLを破壊
         text = text.replace(/<base[^>]*>/gi, '');
         text = text.replace(/target\s*=\s*(["']?)_blank\1/gi, '');
 
-        // あらゆるリンクとフォーム送信をプロキシへ強制誘導するスクリプトを注入
+        // 🌟 サイト独自のJSを「強制停止（stopImmediatePropagation）」させてプロキシへ誘導
         const injectScript = `
           <script>
             try { window.parent.postMessage({ type: 'pageLoaded', url: '${finalUrl}' }, '*'); } catch(e) {}
+            
             document.addEventListener('submit', function(e) {
-              if(e.target && (!e.target.method || e.target.method.toLowerCase() === 'get')) {
-                e.preventDefault();
-                const formData = new FormData(e.target);
-                const params = new URLSearchParams(formData);
-                let actionUrl;
-                try { actionUrl = new URL(e.target.action || window.location.href); } catch(err){ return; }
-                const urlParam = actionUrl.searchParams.get('url');
-                if (urlParam) {
-                   const targetUrlObj = new URL(urlParam);
-                   for(let [k,v] of params) { targetUrlObj.searchParams.append(k,v); }
-                   window.location.href = "${proxyPrefix}" + encodeURIComponent(targetUrlObj.href);
-                }
+              e.preventDefault();
+              e.stopPropagation();
+              e.stopImmediatePropagation(); // サイト側のJSを強制ストップ
+              
+              const form = e.target;
+              const method = (form.method || 'get').toLowerCase();
+              let actionUrl = form.action || window.location.href;
+              
+              let realUrl = actionUrl;
+              try {
+                 const u = new URL(actionUrl);
+                 if (u.searchParams.has('url')) realUrl = u.searchParams.get('url');
+              } catch(err){}
+
+              if (method === 'get') {
+                 const targetUrlObj = new URL(realUrl, window.location.href);
+                 const formData = new FormData(form);
+                 for(let [k,v] of formData) { targetUrlObj.searchParams.append(k,v); }
+                 window.location.href = "${proxyPrefix}" + encodeURIComponent(targetUrlObj.href);
+              } else {
+                 form.action = "${proxyPrefix}" + encodeURIComponent(realUrl);
+                 form.submit();
               }
-            });
+            }, true); // true（キャプチャフェーズで最優先実行）
+
             document.addEventListener('click', function(e) {
                const a = e.target.closest('a');
                if(a && a.href && !a.href.includes('/proxy?url=') && !a.href.startsWith('javascript:') && !a.href.startsWith('data:') && !a.href.startsWith('#')) {
                    e.preventDefault();
+                   e.stopPropagation();
+                   e.stopImmediatePropagation(); // リンククリック時もサイト側JSを強制ストップ
                    window.location.href = "${proxyPrefix}" + encodeURIComponent(a.href);
                }
-            });
+            }, true);
           </script>
         `;
         text = text.replace(/<head[^>]*>/i, `$&${injectScript}`);
