@@ -2,11 +2,9 @@ const express = require('express');
 const axios = require('axios');
 const app = express();
 
-// フォーム送信（POST）のデータを受け取る設定
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// file:/// からのリクエストを許可
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -14,6 +12,15 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(200);
   next();
 });
+
+// HTML特殊文字（&amp;など）を元の記号に戻してURL破損を防ぐ関数
+function unescapeHtml(str) {
+  return str.replace(/&amp;/g, '&')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'")
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>');
+}
 
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 
@@ -27,7 +34,6 @@ app.all('/proxy', async (req, res) => {
       'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8',
     };
 
-    // 検索時のPOSTデータを中継するための処理
     let requestBody = req.body;
     if (req.method === 'POST') {
       if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
@@ -41,11 +47,15 @@ app.all('/proxy', async (req, res) => {
       url: targetUrl,
       data: (req.method === 'POST') ? requestBody : undefined,
       headers: headers,
-      responseType: 'arraybuffer', // 画像やフォントが壊れないようバイナリで取得
+      responseType: 'arraybuffer',
+      maxRedirects: 10, // リダイレクトを一番最後まで自動で追いかける
       validateStatus: () => true
     });
 
-    // 邪魔なセキュリティヘッダーを消して手元に転送
+    // 🌟最重要：リダイレクト後の「最終的な到達URL」を取得する
+    // これがないと、検索エンジンから飛んだ先のサイトの画像が全てリンク切れになる
+    const finalUrl = response.request?.res?.responseUrl || targetUrl;
+
     Object.keys(response.headers).forEach(key => {
       const lower = key.toLowerCase();
       if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin'].includes(lower)) {
@@ -56,20 +66,17 @@ app.all('/proxy', async (req, res) => {
     const contentType = response.headers['content-type'] || '';
     let data = response.data;
 
-    // HTMLやCSSの場合、中身のリンクや画像パスをすべて強制的にプロキシ経由に書き換える
     if (contentType.includes('text/html') || contentType.includes('text/css')) {
       let text = data.toString('utf-8');
 
-      // href(リンク/CSS), src(画像/JS), action(フォーム) のパス書き換え
       text = text.replace(/(href|src|action)=["']([^"']+)["']/gi, (match, attr, url) => {
-        // data:URIやページ内リンク(#)は除外
         if (url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('#')) return match;
         
         try {
-          // 相対パスを絶対パスに自動計算
-          let absoluteUrl = new URL(url, targetUrl).href;
+          url = unescapeHtml(url); // &amp; を & に直す
+          // targetUrlではなく、リダイレクト後の finalUrl を基準に絶対パスを作る
+          let absoluteUrl = new URL(url, finalUrl).href; 
           
-          // YouTube動画リンクは自動でInvidiousへ置換
           if (absoluteUrl.includes('youtube.com/watch') || absoluteUrl.includes('youtu.be/')) {
             const u = new URL(absoluteUrl);
             const vid = u.searchParams.get('v') || u.pathname.slice(1);
@@ -82,11 +89,11 @@ app.all('/proxy', async (req, res) => {
         }
       });
 
-      // CSS内の背景画像( url(...) )の書き換え
       text = text.replace(/url\(['"]?([^'"\)]+)['"]?\)/gi, (match, url) => {
         if (url.startsWith('data:')) return match;
         try {
-          const absoluteUrl = new URL(url, targetUrl).href;
+          url = unescapeHtml(url);
+          const absoluteUrl = new URL(url, finalUrl).href;
           return `url('/proxy?url=${encodeURIComponent(absoluteUrl)}')`;
         } catch (e) {
           return match;
