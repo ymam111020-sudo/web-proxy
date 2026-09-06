@@ -29,10 +29,6 @@ app.all('/proxy', async (req, res) => {
       'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8',
     };
 
-    if (targetUrl.includes('duckduckgo.com')) {
-      headers['Cookie'] = 'p=-2; kp=-2;';
-    }
-
     let requestBody = req.body;
     if (req.method === 'POST') {
       if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
@@ -52,13 +48,11 @@ app.all('/proxy', async (req, res) => {
     });
 
     const finalUrl = response.request?.res?.responseUrl || targetUrl;
-    
-    // 自サーバーのプロキシURLを絶対パスで生成
     const proxyPrefix = `https://${req.get('host')}/proxy?url=`;
 
     Object.keys(response.headers).forEach(key => {
       const lower = key.toLowerCase();
-      // iframeをブロックするヘッダー群を完全消去
+      // iframeを弾く防衛システムを完全に無力化
       if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin', 'strict-transport-security', 'x-xss-protection'].includes(lower)) {
         res.setHeader(key, response.headers[key]);
       }
@@ -71,17 +65,14 @@ app.all('/proxy', async (req, res) => {
       let text = data.toString('utf-8');
 
       if (contentType.includes('text/html')) {
-        // 1. プロキシの誤作動を引き起こす <base> と、別タブを開こうとする target="_blank" を消去
+        // 別タブを開く処理やベースURLを破壊
         text = text.replace(/<base[^>]*>/gi, '');
         text = text.replace(/target\s*=\s*(["']?)_blank\1/gi, '');
 
-        // 2. 🌟 最終兵器：クリックとフォーム送信を100%横取りしてプロキシへ向かわせるJS
+        // あらゆるリンクとフォーム送信をプロキシへ強制誘導するスクリプトを注入
         const injectScript = `
           <script>
-            // URLの手元への同期
             try { window.parent.postMessage({ type: 'pageLoaded', url: '${finalUrl}' }, '*'); } catch(e) {}
-
-            // GETフォームの横取り（検索窓などのバグ修正）
             document.addEventListener('submit', function(e) {
               if(e.target && (!e.target.method || e.target.method.toLowerCase() === 'get')) {
                 e.preventDefault();
@@ -97,8 +88,6 @@ app.all('/proxy', async (req, res) => {
                 }
               }
             });
-
-            // 全リンククリックの横取り（変換漏れリンクを踏んでも絶対にエラーにさせない）
             document.addEventListener('click', function(e) {
                const a = e.target.closest('a');
                if(a && a.href && !a.href.includes('/proxy?url=') && !a.href.startsWith('javascript:') && !a.href.startsWith('data:') && !a.href.startsWith('#')) {
@@ -111,7 +100,6 @@ app.all('/proxy', async (req, res) => {
         text = text.replace(/<head[^>]*>/i, `$&${injectScript}`);
       }
 
-      // 3. サーバー側でのURL書き換え（""で囲まれていない特殊なURL表記にも対応）
       text = text.replace(/(href|src|action)\s*=\s*(?:["']([^"']+)["']|([^\s>]+))/gi, (match, attr, quoted, unquoted) => {
         let url = quoted || unquoted;
         if (!url || url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('#')) return match;
