@@ -29,6 +29,11 @@ app.all('/proxy', async (req, res) => {
       'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8',
     };
 
+    // 🌟 修正ポイント：DuckDuckGoにアクセスする時は、常にセーフサーチOFFのCookie（電子チケット）を強制的に送りつける
+    if (targetUrl.includes('duckduckgo.com')) {
+      headers['Cookie'] = 'p=-2; kp=-2;';
+    }
+
     let requestBody = req.body;
     if (req.method === 'POST') {
       if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
@@ -49,7 +54,6 @@ app.all('/proxy', async (req, res) => {
 
     const finalUrl = response.request?.res?.responseUrl || targetUrl;
 
-    // iframe拒否やCORSエラーの原因となるヘッダーをすべて抹消
     Object.keys(response.headers).forEach(key => {
       const lower = key.toLowerCase();
       if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin', 'strict-transport-security', 'x-xss-protection'].includes(lower)) {
@@ -63,7 +67,6 @@ app.all('/proxy', async (req, res) => {
     if (contentType.includes('text/html') || contentType.includes('text/css')) {
       let text = data.toString('utf-8');
 
-      // サイト側のJSによるiframe脱出（フレームバスター）を無効化し、手元へ現在URLを送信するスクリプト
       const injectScript = `
         <script>
           try {
