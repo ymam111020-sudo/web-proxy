@@ -5,7 +5,7 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// file:/// からのリクエストを許可
+// file:/// からのリクエストを全許可
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -17,15 +17,9 @@ app.use((req, res, next) => {
 app.get('/ping', (req, res) => res.status(200).send('pong'));
 app.get('/', (req, res) => res.status(200).send('Proxy Gateway Live'));
 
-// DuckDuckGoのフォーム送信（POST /html/）を受け止めて中継するハンドラー
-app.post('/html/', (req, res) => {
-  const query = req.body.q || '';
-  res.redirect(`/proxy?url=${encodeURIComponent('https://html.duckduckgo.com/html/?q=' + encodeURIComponent(query))}`);
-});
-
-// プロトコル中継エンドポイント
+// プロキシ中継ハンドラー
 app.all('/proxy', async (req, res) => {
-  const targetUrl = req.query.url;
+  let targetUrl = req.query.url;
   if (!targetUrl) return res.status(400).send('Target URL required');
 
   try {
@@ -42,7 +36,7 @@ app.all('/proxy', async (req, res) => {
       validateStatus: () => true
     });
 
-    // レスポンスヘッダーの転送（iframe制限ヘッダーのみ削除）
+    // レスポンスヘッダー転送（iframe制限ヘッダーを削除）
     Object.keys(response.headers).forEach(key => {
       const lower = key.toLowerCase();
       if (lower !== 'x-frame-options' && lower !== 'content-security-policy') {
@@ -52,14 +46,32 @@ app.all('/proxy', async (req, res) => {
 
     let data = response.data;
 
-    // HTMLコンテンツの場合、相対パスのフォームアクションやベースタグを補正
+    // HTMLの場合、すべてのリンクとフォームを自動で /proxy 経由に書き換える
     if (typeof data === 'string' && response.headers['content-type']?.includes('text/html')) {
       const parsed = new URL(targetUrl);
       const origin = parsed.origin;
-      // 相対パスのリンクやリソースを元のドメインに向ける
-      if (!data.includes('<base ')) {
-        data = data.replace(/<head[^>]*>/i, `$&<base href="${origin}/">`);
-      }
+
+      // 1. DuckDuckGoのPOSTフォームをGET形式で /proxy に流すよう書き換え
+      data = data.replace(/<form\b([^>]*?)action="\/html\/"([^>]*?)method="post"/gi, 
+        `<form$1action="/proxy" method="get"$2><input type="hidden" name="url" value="https://html.duckduckgo.com/html/">`
+      );
+
+      // 2. ページ内の全 a リンク (href) を /proxy?url=... に変換
+      data = data.replace(/href="(\/[^"]*?)"/gi, (match, p1) => {
+        return `href="/proxy?url=${encodeURIComponent(origin + p1)}"`;
+      });
+      data = data.replace(/href="(https?:\/\/[^"]*?)"/gi, (match, p1) => {
+        // YouTube動画リンクを踏んだ場合はInvidiousに置換
+        let dest = p1;
+        if (dest.includes('youtube.com/watch') || dest.includes('youtu.be/')) {
+          try {
+            const u = new URL(dest);
+            const vid = u.searchParams.get('v') || u.pathname.slice(1);
+            dest = `https://yewtu.be/watch?v=${vid}`;
+          } catch(e) {}
+        }
+        return `href="/proxy?url=${encodeURIComponent(dest)}"`;
+      });
     }
 
     res.status(response.status).send(data);
