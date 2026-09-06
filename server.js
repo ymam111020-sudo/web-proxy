@@ -13,13 +13,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// HTML特殊文字（&amp;など）を元の記号に戻してURL破損を防ぐ関数
 function unescapeHtml(str) {
-  return str.replace(/&amp;/g, '&')
-            .replace(/&quot;/g, '"')
-            .replace(/&#39;/g, "'")
-            .replace(/&lt;/g, '<')
-            .replace(/&gt;/g, '>');
+  return str.replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 }
 
 app.get('/ping', (req, res) => res.status(200).send('pong'));
@@ -48,17 +43,16 @@ app.all('/proxy', async (req, res) => {
       data: (req.method === 'POST') ? requestBody : undefined,
       headers: headers,
       responseType: 'arraybuffer',
-      maxRedirects: 10, // リダイレクトを一番最後まで自動で追いかける
+      maxRedirects: 10,
       validateStatus: () => true
     });
 
-    // 🌟最重要：リダイレクト後の「最終的な到達URL」を取得する
-    // これがないと、検索エンジンから飛んだ先のサイトの画像が全てリンク切れになる
     const finalUrl = response.request?.res?.responseUrl || targetUrl;
 
+    // iframe拒否やCORSエラーの原因となるヘッダーをすべて抹消
     Object.keys(response.headers).forEach(key => {
       const lower = key.toLowerCase();
-      if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin'].includes(lower)) {
+      if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin', 'strict-transport-security', 'x-xss-protection'].includes(lower)) {
         res.setHeader(key, response.headers[key]);
       }
     });
@@ -69,20 +63,31 @@ app.all('/proxy', async (req, res) => {
     if (contentType.includes('text/html') || contentType.includes('text/css')) {
       let text = data.toString('utf-8');
 
+      // サイト側のJSによるiframe脱出（フレームバスター）を無効化し、手元へ現在URLを送信するスクリプト
+      const injectScript = `
+        <script>
+          try {
+            Object.defineProperty(window, 'top', { value: window, writable: false });
+            Object.defineProperty(window, 'parent', { value: window, writable: false });
+          } catch(e) {}
+          window.parent.postMessage({ type: 'pageLoaded', url: '${finalUrl}' }, '*');
+        </script>
+      `;
+
+      if (contentType.includes('text/html')) {
+        text = text.replace(/<head[^>]*>/i, `$&${injectScript}`);
+      }
+
       text = text.replace(/(href|src|action)=["']([^"']+)["']/gi, (match, attr, url) => {
         if (url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('#')) return match;
-        
         try {
-          url = unescapeHtml(url); // &amp; を & に直す
-          // targetUrlではなく、リダイレクト後の finalUrl を基準に絶対パスを作る
+          url = unescapeHtml(url);
           let absoluteUrl = new URL(url, finalUrl).href; 
-          
           if (absoluteUrl.includes('youtube.com/watch') || absoluteUrl.includes('youtu.be/')) {
             const u = new URL(absoluteUrl);
             const vid = u.searchParams.get('v') || u.pathname.slice(1);
             absoluteUrl = `https://yewtu.be/watch?v=${vid}`;
           }
-          
           return `${attr}="/proxy?url=${encodeURIComponent(absoluteUrl)}"`;
         } catch (e) {
           return match;
