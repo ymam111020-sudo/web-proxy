@@ -29,11 +29,6 @@ app.all('/proxy', async (req, res) => {
       'Accept-Language': 'ja,ja-JP;q=0.9,en;q=0.8',
     };
 
-    // 🌟 修正ポイント：DuckDuckGoにアクセスする時は、常にセーフサーチOFFのCookie（電子チケット）を強制的に送りつける
-    if (targetUrl.includes('duckduckgo.com')) {
-      headers['Cookie'] = 'p=-2; kp=-2;';
-    }
-
     let requestBody = req.body;
     if (req.method === 'POST') {
       if (req.headers['content-type']) headers['Content-Type'] = req.headers['content-type'];
@@ -56,7 +51,7 @@ app.all('/proxy', async (req, res) => {
 
     Object.keys(response.headers).forEach(key => {
       const lower = key.toLowerCase();
-      if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin', 'strict-transport-security', 'x-xss-protection'].includes(lower)) {
+      if (!['x-frame-options', 'content-security-policy', 'access-control-allow-origin'].includes(lower)) {
         res.setHeader(key, response.headers[key]);
       }
     });
@@ -67,20 +62,13 @@ app.all('/proxy', async (req, res) => {
     if (contentType.includes('text/html') || contentType.includes('text/css')) {
       let text = data.toString('utf-8');
 
-      const injectScript = `
-        <script>
-          try {
-            Object.defineProperty(window, 'top', { value: window, writable: false });
-            Object.defineProperty(window, 'parent', { value: window, writable: false });
-          } catch(e) {}
-          window.parent.postMessage({ type: 'pageLoaded', url: '${finalUrl}' }, '*');
-        </script>
-      `;
-
+      // iframe内でのページ遷移を検知してURLバーに同期させるスクリプト
+      const injectScript = `<script>window.parent.postMessage({ type: 'pageLoaded', url: '${finalUrl}' }, '*');</script>`;
       if (contentType.includes('text/html')) {
         text = text.replace(/<head[^>]*>/i, `$&${injectScript}`);
       }
 
+      // 1. 通常のリンクや画像パスの書き換え
       text = text.replace(/(href|src|action)=["']([^"']+)["']/gi, (match, attr, url) => {
         if (url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('#')) return match;
         try {
@@ -97,6 +85,7 @@ app.all('/proxy', async (req, res) => {
         }
       });
 
+      // 2. CSS内の画像の書き換え
       text = text.replace(/url\(['"]?([^'"\)]+)['"]?\)/gi, (match, url) => {
         if (url.startsWith('data:')) return match;
         try {
@@ -107,6 +96,22 @@ app.all('/proxy', async (req, res) => {
           return match;
         }
       });
+
+      // 3. 🌟 1秒ループの原因（<meta refresh>）をプロキシ経由に修正
+      text = text.replace(/content=["']([0-9]+;\s*url=)([^"']+)["']/gi, (match, prefix, url) => {
+        try {
+          url = unescapeHtml(url);
+          const absoluteUrl = new URL(url, finalUrl).href;
+          return `content="${prefix}/proxy?url=${encodeURIComponent(absoluteUrl)}"`;
+        } catch (e) {
+          return match;
+        }
+      });
+
+      // 4. 🌟 DuckDuckGoなら、Botにバレないよう「透明なセーフサーチOFFボタン」をフォームに仕込む
+      if (finalUrl.includes('duckduckgo.com')) {
+        text = text.replace(/(<form[^>]+>)/gi, '$1<input type="hidden" name="kp" value="-2">');
+      }
 
       data = Buffer.from(text, 'utf-8');
     }
